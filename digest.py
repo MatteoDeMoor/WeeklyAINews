@@ -19,14 +19,14 @@ from jinja2 import Template
 from openai import OpenAI
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
-
-"""Weekly AI News Digest generator.
-
-This script fetches news from RSS feeds, deduplicates similar stories,
-classifies and ranks them, summarises with OpenAI (optional) and renders
-a Markdown digest. When SMTP credentials are provided it can also send
-the digest as an email.
-"""
+from html import unescape as html_unescape
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+try:
+    import requests
+    from urllib3.util.retry import Retry
+    from requests.adapters import HTTPAdapter
+except Exception:
+    requests = None
 
 # ---- Settings ----
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -40,6 +40,9 @@ SECTIONS = {
 MAX_PER_SECTION = 8
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(message)s")
+# reduce noisy third-party logs
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("trafilatura").setLevel(logging.WARNING)
 
 # ---- Utils ----
 def load_feeds(fp: str = "config/feeds.yaml") -> List[str]:
@@ -52,14 +55,78 @@ def norm_date(s: str) -> dt.date:
     except Exception:
         return dt.date.today()
 
-def extract_text(url: str) -> str:
+def clean_url(url: str) -> str:
+    try:
+        url = (url or "").strip()
+        if not url:
+            return ""
+        parts = urlparse(url)
+        # strip common tracking params
+        q = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=False)
+             if not k.lower().startswith("utm_") and k.lower() not in {"fbclid", "gclid"}]
+        new_query = urlencode(q)
+        return urlunparse((parts.scheme, parts.netloc, parts.path, parts.params, new_query, parts.fragment))
+    except Exception:
+        return url or ""
+
+def host_of(url: str) -> str:
+    try:
+        netloc = urlparse(url).netloc.lower()
+        return netloc[4:] if netloc.startswith("www.") else netloc
+    except Exception:
+        return ""
+
+def _build_session():
+    if requests is None:
+        return None
+    sess = requests.Session()
+    sess.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/126.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,nl;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    })
+    retry = Retry(total=2, backoff_factor=0.4,
+                  status_forcelist=(429, 500, 502, 503, 504),
+                  allowed_methods=("GET", "HEAD"), raise_on_status=False)
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=30, pool_maxsize=30)
+    sess.mount("http://", adapter)
+    sess.mount("https://", adapter)
+    return sess
+
+HTTP = _build_session()
+
+def _fetch_html(url: str) -> str:
+    if HTTP is not None:
+        try:
+            r = HTTP.get(url, timeout=15)
+            if r.status_code != 200:
+                logging.error("not a 200 response: %s for URL %s", r.status_code, url)
+                return ""
+            return r.text
+        except Exception as exc:
+            logging.warning("requests fetch failed for %s: %s", url, exc)
+            return ""
     try:
         downloaded = trafilatura.fetch_url(url, no_ssl=True)
-        if not downloaded:
-            return ""
-        return trafilatura.extract(downloaded, include_comments=False, include_tables=False) or ""
+        return downloaded or ""
     except Exception as exc:
-        logging.warning("Failed to fetch %s: %s", url, exc)
+        logging.warning("trafilatura.fetch_url failed for %s: %s", url, exc)
+        return ""
+
+def extract_text(url: str) -> str:
+    try:
+        html = _fetch_html(url)
+        if not html:
+            return ""
+        return trafilatura.extract(html, url=url, include_comments=False, include_tables=False) or ""
+    except Exception as exc:
+        logging.warning("Failed to extract %s: %s", url, exc)
         return ""
 
 def sha(s: str) -> str:
@@ -115,20 +182,40 @@ def collect_entries(feeds: List[str]) -> List[Dict]:
     for url in feeds:
         try:
             d = feedparser.parse(url)
+            status = getattr(d, "status", None)
+            if isinstance(status, int) and status >= 400:
+                logging.warning("Skip feed %s (HTTP %s)", url, status)
+                continue
+            if getattr(d, "bozo", 0) and not getattr(d, "entries", []):
+                logging.warning("Bozo feed %s: %s", url, getattr(d, "bozo_exception", ""))
+                continue
         except Exception as exc:
             logging.warning("Failed to parse feed %s: %s", url, exc)
             continue
+        if not getattr(d, "entries", None):
+            logging.warning("No entries in feed %s", url)
+            continue
         for e in d.entries:
-            link = e.get("link", "")
-            title = e.get("title", "").strip()
+            link = clean_url(e.get("link", ""))
+            title = html_unescape(e.get("title", "")).strip()
             if not link or not title:
                 continue
+            # fallback description from feed
+            desc = e.get("summary") or e.get("description") or ""
+            if not desc and e.get("content"):
+                try:
+                    desc = e.get("content")[0].get("value", "")
+                except Exception:
+                    pass
+            desc = html_unescape(re.sub(r"<[^>]+>", " ", desc))
+            desc = " ".join(desc.split())
             items.append({
                 "id": sha(link),
                 "title": title,
                 "link": link,
                 "date": norm_date(e.get("published", e.get("updated", ""))),
-                "source": re.sub(r"^https?://(www\.)?", "", link).split("/")[0]
+                "source": host_of(link),
+                "desc": desc,
             })
     return items
 
@@ -213,6 +300,17 @@ MD_TEMPLATE = """Weekly AI News Digest — {{ today.isoformat() }}
 {% endfor %}
 """
 
+# Newer, cleaner Markdown template (keeps old for compatibility)
+NEW_MD_TEMPLATE = """Weekly AI News Digest — {{ today.isoformat() }}
+
+{% for sec, items in sections.items() if items %}
+**{{ sec }}**
+{% for it in items %}
+- {{ it['bullet'] }}
+{% endfor %}
+{% endfor %}
+"""
+
 def main() -> None:
     feeds = load_feeds()
     raw = collect_entries(feeds)
@@ -223,11 +321,11 @@ def main() -> None:
     deduped = cluster_and_pick(prelim)
 
     # Extract text concurrently
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=6) as ex:
         futures = {ex.submit(extract_text, it["link"]): it for it in deduped}
         for fut in tqdm(as_completed(futures), total=len(futures), desc="Extract"):
             it = futures[fut]
-            it["text"] = fut.result()
+            it["text"] = fut.result() or it.get("desc", "")
             it["section"] = categorize(it["title"], it["text"])
 
     buckets = defaultdict(list)
@@ -245,8 +343,14 @@ def main() -> None:
             else:
                 summ = safe_short(it["text"] or it["title"])
             it["bullet"] = f"{it['title']} ({it['date'].isoformat()}) — {summ} [{it['source']}]({it['link']})"
+            it["bullet"] = f"{it['title']} ({it['date'].isoformat()}) — {summ} [{it['source']}]({it['link']})"
 
-    tpl = Template(MD_TEMPLATE)
+    # ensure bullet format is clean (override any earlier assignment)
+    for sec in buckets:
+        for it in buckets[sec]:
+            if "bullet" in it:
+                it["bullet"] = f"{it['title']} ({it['date'].isoformat()}) — {it.get('bullet').split(')')[-1].strip()}"
+    tpl = Template(NEW_MD_TEMPLATE)
     md = tpl.render(today=today, sections=buckets)
 
     os.makedirs("out", exist_ok=True)

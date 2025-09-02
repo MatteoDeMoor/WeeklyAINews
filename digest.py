@@ -326,7 +326,7 @@ def robust_llm_summary(client: OpenAI, text: str, title: str, url: str, date: dt
 # ---- Render ----
 NEW_MD_TEMPLATE = """# Weekly AI News Digest — {{ today.isoformat() }}
 
-_What happened in the last {{ window_days }} days._
+What happened in the last {{ window_days }} days?
 
 {% for sec, items in sections.items() if items %}
 ## {{ sec }}

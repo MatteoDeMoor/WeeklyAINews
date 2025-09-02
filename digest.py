@@ -7,6 +7,7 @@ import feedparser
 import datetime as dt
 import logging
 import smtplib
+from bs4 import BeautifulSoup
 from email.mime.text import MIMEText
 from dateutil import parser as dparser
 from collections import defaultdict
@@ -35,6 +36,7 @@ load_dotenv()
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 SIM_THRESHOLD = 0.86
 RECENCY_WINDOW_DAYS = 7
+MAX_PER_SECTION = 8
 
 SECTIONS = {
     "Model updates": r"(model|weights|gpt|gemini|claude|mixtral|llama|blackwell|rtx|inference|realtime)",
@@ -42,7 +44,11 @@ SECTIONS = {
     "Investments & Business": r"(raise|funding|series|revenue|acquire|merger|partnership|deal|ipo|earnings|stake)",
     "Ethical & Privacy": r"(privacy|copyright|lawsuit|policy|safety|guardrail|misuse|security|breach|teen|compliance|dsar|gdpr)"
 }
-MAX_PER_SECTION = 8
+
+SKIP_EXTRACT_HOSTS = {
+    "openai.com", "medium.com", "bloomberg.com", "wsj.com",
+    "ft.com", "nytimes.com"
+}
 
 # ---- Logging ----
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(message)s")
@@ -53,6 +59,27 @@ logging.getLogger("trafilatura").setLevel(logging.WARNING)
 def load_feeds(fp: str = "config/feeds.yaml") -> List[str]:
     with open(fp, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)["feeds"]
+    
+def normalize_feeds(feed_urls: List[str]) -> List[str]:
+    normed = []
+    for u in feed_urls:
+        u = clean_url(u)
+        if not u:
+            continue
+        d = feedparser.parse(u)
+        status = getattr(d, "status", None)
+        if (isinstance(status, int) and status >= 400) or (getattr(d, "bozo", 0) and not getattr(d, "entries", [])):
+            wp = wp_feed_fallback(u)
+            if wp:
+                normed.append(wp)
+                continue
+            if u.endswith("/") or any(x in u for x in ["/blog", "/category", "/tag", "/news"]):
+                disc = discover_feed_url(u)
+                if disc:
+                    normed.append(disc)
+                    continue
+        normed.append(u)
+    return list(dict.fromkeys(normed))
 
 def norm_date(s: str) -> dt.date:
     try:
@@ -115,7 +142,8 @@ def _fetch_html(url: str) -> str:
         try:
             r = HTTP.get(url, timeout=15)
             if r.status_code != 200:
-                logging.error("Non-200 response: %s for URL %s", r.status_code, url)
+                level = logging.WARNING if r.status_code in (401, 403, 429) else logging.ERROR
+                logging.log(level, "Fetch %s returned %s", url, r.status_code)
                 return ""
             return r.text
         except Exception as exc:
@@ -130,6 +158,8 @@ def _fetch_html(url: str) -> str:
 
 def extract_text(url: str) -> str:
     try:
+        if host_of(url) in SKIP_EXTRACT_HOSTS:
+            return ""
         html = _fetch_html(url)
         if not html:
             return ""
@@ -137,6 +167,7 @@ def extract_text(url: str) -> str:
     except Exception as exc:
         logging.warning("Failed to extract %s: %s", url, exc)
         return ""
+
 
 def sha(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
@@ -154,7 +185,7 @@ def rank_score(item: Dict, today: dt.date) -> float:
     recency = max(0.0, 1.0 - min(days, RECENCY_WINDOW_DAYS) / float(RECENCY_WINDOW_DAYS))
     trust = 1.0 if any(k in item["link"] for k in [
         "openai.com", "ai.googleblog", "anthropic.com", "techcrunch.com",
-        "theverge.com", "venturebeat.com", "arxiv.org"
+        "theverge.com", "venturebeat.com", "zdnet.com",
     ]) else 0.5
     novelty = item.get("novelty", 0.7)
     return 0.45 * recency + 0.35 * trust + 0.20 * novelty
@@ -168,23 +199,70 @@ def send_email(subject: str, body: str) -> None:
     port = int(os.getenv("SMTP_PORT", "587"))
     user = os.getenv("SMTP_USER")
     pwd = os.getenv("SMTP_PASSWORD")
-    to_addr = os.getenv("MAIL_TO")
+    to_raw = os.getenv("MAIL_TO", "")
+    cc_raw = os.getenv("MAIL_CC", "")
+    bcc_raw = os.getenv("MAIL_BCC", "")
     from_addr = os.getenv("MAIL_FROM", user)
-    if not all([host, user, pwd, to_addr, from_addr]):
-        logging.info("Email credentials missing, skipping mail send.")
+
+    def parse_list(s: str) -> list[str]:
+        return [a.strip() for a in s.split(",") if a.strip()]
+
+    to_addrs = parse_list(to_raw)
+    cc_addrs = parse_list(cc_raw)
+    bcc_addrs = parse_list(bcc_raw)
+
+    recipients = to_addrs + cc_addrs + bcc_addrs
+
+    if not all([host, user, pwd, from_addr]) or not recipients:
+        logging.info("Email settings incomplete or no recipients; skipping mail send.")
         return
+
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
     msg["From"] = from_addr
-    msg["To"] = to_addr
+    if to_addrs:
+        msg["To"] = ", ".join(to_addrs)
+    if cc_addrs:
+        msg["Cc"] = ", ".join(cc_addrs)
+
     try:
         with smtplib.SMTP(host, port) as smtp:
             smtp.starttls()
             smtp.login(user, pwd)
-            smtp.send_message(msg)
-            logging.info("Mail sent to %s", to_addr)
+            smtp.send_message(msg, from_addr=from_addr, to_addrs=recipients)
+            logging.info("Mail sent to: %s", ", ".join(recipients))
     except Exception as exc:
         logging.error("Failed to send mail: %s", exc)
+
+def discover_feed_url(page_url: str) -> str:
+    try:
+        html = _fetch_html(page_url)
+        if not html:
+            return ""
+        soup = BeautifulSoup(html, "lxml")
+        alt = soup.find("link", rel=lambda x: x and "alternate" in x, type=lambda t: t and "rss" in t.lower() or "atom" in t.lower())
+        if alt and alt.get("href"):
+            return clean_url(alt["href"])
+    except Exception:
+        pass
+    return ""
+
+def wp_feed_fallback(url: str) -> str:
+    try:
+        parts = urlparse(url)
+        # als het al eindigt op /feed of /feed/ doe niets
+        if parts.path.rstrip("/").endswith("/feed"):
+            return url
+        candidate = urlunparse((parts.scheme, parts.netloc, parts.path.rstrip("/") + "/feed/", "", "", ""))
+        # quick probe (HEAD/GET) via requests sessie
+        if HTTP:
+            r = HTTP.get(candidate, timeout=10)
+            if r.status_code == 200 and ("<rss" in r.text or "<feed" in r.text):
+                return candidate
+    except Exception:
+        pass
+    return ""
+
 
 # ---- Ingest ----
 def collect_entries(feeds: List[str]) -> List[Dict]:
@@ -340,6 +418,7 @@ What happened in the last {{ window_days }} days?
 
 def main() -> None:
     feeds = load_feeds()
+    feeds = normalize_feeds(feeds)
     raw = collect_entries(feeds)
     logging.info("Fetched %d items", len(raw))
     today = dt.date.today()
@@ -374,7 +453,17 @@ def main() -> None:
     client = None
     if api_key:
         try:
-            client = OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
+            from httpx import Client as HTTPXClient
+            httpx_kwargs = dict(timeout=30.0)
+            proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
+            if proxy:
+                httpx_kwargs["proxies"] = proxy
+            httpx = HTTPXClient(**httpx_kwargs)
+
+            if base_url:
+                client = OpenAI(api_key=api_key, base_url=base_url, http_client=httpx)
+            else:
+                client = OpenAI(api_key=api_key, http_client=httpx)
         except Exception as exc:
             logging.warning("Failed to init OpenAI client: %s", exc)
             client = None

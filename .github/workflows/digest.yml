@@ -2,8 +2,8 @@ name: Weekly AI Digest
 on:
   push:
     branches: [ main ]
-  schedule:
-    - cron: "*/10 * * * *" # 0 6 * * MON
+  # schedule:
+  #  - cron: "*/10 * * * *" # 0 6 * * MON
   workflow_dispatch:
 
 jobs:

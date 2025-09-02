@@ -1,37 +1,38 @@
 ﻿import os
 import re
-import hashlib
-import textwrap
 import yaml
-import feedparser
-import datetime as dt
 import logging
 import smtplib
+import hashlib
+import textwrap
+import feedparser
+import trafilatura
+from tqdm import tqdm
+import datetime as dt
+from openai import OpenAI
 from bs4 import BeautifulSoup
+from zoneinfo import ZoneInfo
+from typing import List, Dict
+from jinja2 import Environment
+from collections import defaultdict
 from email.mime.text import MIMEText
 from dateutil import parser as dparser
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict
-from tqdm import tqdm
-import trafilatura
-from jinja2 import Template
-from openai import OpenAI
+from html import unescape as html_unescape
+from email.mime.multipart import MIMEMultipart
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
-from html import unescape as html_unescape
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+try:
+    import markdown as mdlib
+except Exception:
+    mdlib = None
 try:
     import requests
     from urllib3.util.retry import Retry
     from requests.adapters import HTTPAdapter
 except Exception:
     requests = None
-from email.mime.multipart import MIMEMultipart
-try:
-    import markdown as mdlib
-except Exception:
-    mdlib = None
 
 # Load environment variables from .env file if present
 from dotenv import load_dotenv
@@ -61,6 +62,9 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("trafilatura").setLevel(logging.WARNING)
 
 # ---- Utils ----
+def now_brussels() -> dt.datetime:
+    return dt.datetime.now(ZoneInfo("Europe/Brussels"))
+
 def load_feeds(fp: str = "config/feeds.yaml") -> List[str]:
     with open(fp, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)["feeds"]
@@ -86,11 +90,14 @@ def normalize_feeds(feed_urls: List[str]) -> List[str]:
         normed.append(u)
     return list(dict.fromkeys(normed))
 
-def norm_date(s: str) -> dt.date:
+def norm_date(s: str) -> dt.datetime:
     try:
-        return dparser.parse(s).date()
+        dt_parsed = dparser.parse(s)
+        if dt_parsed.tzinfo is None:
+            dt_parsed = dt_parsed.replace(tzinfo=dt.timezone.utc)
+        return dt_parsed.astimezone(ZoneInfo("Europe/Brussels"))
     except Exception:
-        return dt.date.today()
+        return now_brussels()
 
 def clean_url(url: str) -> str:
     try:
@@ -184,15 +191,15 @@ def categorize(title: str, text: str) -> str:
             return sec
     return "New AI tools and features"
 
-def rank_score(item: Dict, today: dt.date) -> float:
-    days = max(0, (today - item["date"]).days)
-    # Use the 8-day window for recency scaling.
-    recency = max(0.0, 1.0 - min(days, RECENCY_WINDOW_DAYS) / float(RECENCY_WINDOW_DAYS))
+def rank_score(item: Dict, now_bxl: dt.datetime) -> float:
+    delta_days = max(0.0, (now_bxl - item["date"]).total_seconds() / 86400.0)
+    recency = max(0.0, 1.0 - min(delta_days, float(RECENCY_WINDOW_DAYS)) / float(RECENCY_WINDOW_DAYS))
+
     trust = 1.0 if any(k in item["link"] for k in [
         "openai.com", "ai.googleblog", "anthropic.com", "techcrunch.com",
         "theverge.com", "venturebeat.com", "zdnet.com",
     ]) else 0.5
-    novelty = item.get("novelty", 0.7)
+    novelty = float(item.get("novelty", 0.7))
     return 0.45 * recency + 0.35 * trust + 0.20 * novelty
 
 def safe_short(text: str, n: int = 220) -> str:
@@ -221,7 +228,8 @@ def send_email(subject: str, body_md: str) -> None:
         logging.info("Email settings incomplete or no recipients; skipping mail send.")
         return
 
-    html_body = md_to_html(body_md)
+    preheader_line = (body_md.splitlines()[0] if body_md else "").strip()
+    html_body = md_to_html(body_md, preheader=preheader_line or "Weekly AI News Digest")
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
@@ -272,42 +280,116 @@ def wp_feed_fallback(url: str) -> str:
         pass
     return ""
 
-def md_to_html(md_text: str) -> str:
+def slugify(text: str) -> str:
+    t = re.sub(r"<[^>]+>", "", text)  # strip eventuele tags
+    t = re.sub(r"[^\w\s\-]", "", t, flags=re.UNICODE).strip().lower()
+    t = re.sub(r"\s+", "-", t)
+    return t
+
+def add_heading_ids(html: str) -> str:
+    """Voegt id-ankers toe aan h1/h2/h3 die nog geen id hebben."""
+    def _add_id(m):
+        tag, inner = m.group(1), m.group(2)
+        # als er al een id is, laat staan
+        if re.search(r'\sid\s*=\s*"', inner):
+            return m.group(0)
+        # haal plain text binnen de tag op
+        text = re.sub(r"<[^>]*>", "", inner)
+        _id = slugify(text)
+        return f"<{tag} id=\"{_id}\">{inner}</{tag}>"
+
+    # alleen headings binnen body aanpassen
+    html = re.sub(r"<(h[1-3])>(.*?)</\1>", _add_id, html, flags=re.IGNORECASE | re.DOTALL)
+    return html
+
+def md_to_html(md_text: str, preheader: str = "") -> str:
+    """
+    Render Markdown naar responsive HTML met:
+    - Preheader (verborgen in inbox preview)
+    - Dark mode via prefers-color-scheme
+    - Heading anchors (id op h1/h2/h3)
+    """
     if mdlib:
         body = mdlib.markdown(
             md_text,
-            extensions=["tables", "fenced_code", "sane_lists", "toc"]
+            extensions=["tables", "fenced_code", "sane_lists", "toc", "attr_list"]
         )
     else:
-        import html, re
+        import html, re as _re
         t = html.escape(md_text)
-        t = re.sub(r"^# (.+)$", r"<h1>\1</h1>", t, flags=re.MULTILINE)
-        t = re.sub(r"^## (.+)$", r"<h2>\1</h2>", t, flags=re.MULTILINE)
-        t = re.sub(r"^### (.+)$", r"<h3>\1</h3>", t, flags=re.MULTILINE)
-        t = re.sub(r"^(?:- |\* )(.*)$", r"<li>\1</li>", t, flags=re.MULTILINE)
-        t = re.sub(r"(?:<li>.*</li>\n?)+", lambda m: "<ul>\n"+m.group(0)+"\n</ul>", t)
-        t = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', t)
+        t = _re.sub(r"^# (.+)$", r"<h1>\1</h1>", t, flags=_re.MULTILINE)
+        t = _re.sub(r"^## (.+)$", r"<h2>\1</h2>", t, flags=_re.MULTILINE)
+        t = _re.sub(r"^### (.+)$", r"<h3>\1</h3>", t, flags=_re.MULTILINE)
+        t = _re.sub(r"^(?:- |\* )(.*)$", r"<li>\1</li>", t, flags=_re.MULTILINE)
+        t = _re.sub(r"(?:<li>.*</li>\n?)+", lambda m: "<ul>\n"+m.group(0)+"\n</ul>", t)
+        t = _re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', t)
         body = "<p>" + t.replace("\n\n", "</p><p>").replace("\n", "<br>") + "</p>"
+
+    # voeg anchors toe
+    body = add_heading_ids(body)
+
+    # preheader (zichtbaar in inbox preview, verborgen in body)
+    preheader_html = ""
+    if preheader:
+        preheader_html = f"""
+<span class="preheader">{preheader}</span>
+"""
 
     return f"""<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<!-- Hint voor mailclients/browsers -->
+<meta name="color-scheme" content="light dark">
+<meta name="supported-color-schemes" content="light dark">
 <style>
-body {{ font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; line-height:1.5; color:#111; }}
-h1 {{ font-size:20px; margin:0 0 12px; }}
-h2 {{ font-size:16px; margin:18px 0 8px; border-bottom:1px solid #eee; padding-bottom:4px; }}
-h3 {{ font-size:14px; margin:14px 0 6px; }}
-ul {{ padding-left:20px; }}
+/* Preheader: verborgen in mail body maar zichtbaar in preview */
+.preheader {{
+  display:none !important; visibility:hidden; opacity:0; color:transparent; height:0; width:0; overflow:hidden;
+  mso-hide:all;
+}}
+:root {{
+  color-scheme: light dark;
+  supported-color-schemes: light dark;
+}}
+body {{
+  margin:0; padding:0;
+  font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+  line-height:1.55; color:#111; background:#ffffff;
+}}
+.container {{
+  max-width:820px; margin:0 auto; padding:16px 20px;
+}}
+h1 {{ font-size:22px; margin:0 0 12px; }}
+h2 {{ font-size:18px; margin:18px 0 8px; border-bottom:1px solid #eee; padding-bottom:4px; }}
+h3 {{ font-size:16px; margin:14px 0 6px; }}
+ul {{ padding-left:22px; }}
 a {{ color:#0b57d0; text-decoration:none; }}
 a:hover {{ text-decoration:underline; }}
-code, pre {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:#f6f8fa; padding:2px 4px; border-radius:4px; }}
-.container {{ max-width:820px; margin:0 auto; }}
+code, pre {{
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background:#f6f8fa; padding:2px 4px; border-radius:4px;
+}}
+/* Anchor styling (optioneel): laat # kopieerbaar zijn zonder visuele ruis in mailclients */
+h1, h2, h3 {{
+  scroll-margin-top: 80px;
+}}
+@media (prefers-color-scheme: dark) {{
+  body {{ color:#e6e6e6; background:#0b0b0b; }}
+  .container {{ background:#0b0b0b; }}
+  a {{ color:#8ab4ff; }}
+  code, pre {{ background:#111418; }}
+  h2 {{ border-bottom-color:#222; }}
+}}
 </style>
 </head>
-<body><div class="container">
+<body>
+{preheader_html}
+<div class="container">
 {body}
-</div></body>
+</div>
+</body>
 </html>"""
 
 # ---- Ingest ----
@@ -384,7 +466,7 @@ def cluster_and_pick(items: List[Dict]) -> List[Dict]:
                         or "openai.com" in x["link"]
                         or "ai.googleblog" in x["link"]
                     ),
-                    -x["date"].toordinal(),
+                    -x["date"].timestamp(),
                 ),
             )[0]
             for it in group:
@@ -400,7 +482,7 @@ def cluster_and_pick(items: List[Dict]) -> List[Dict]:
         return list(uniq.values())
 
 # ---- Summaries ----
-def llm_summary(client: OpenAI, text: str, title: str, url: str, date: dt.date) -> str:
+def llm_summary(client: OpenAI, text: str, title: str, url: str, date: dt.datetime) -> str:
     if not text.strip():
         return f"{title} — (Could not extract text). Read more: {url}"
     prompt = f"""Summarize this news in exactly 2 concise sentences (EN). Include 1 fitting emoji.
@@ -423,8 +505,8 @@ TEXT:
         logging.warning("LLM summarization failed: %s", exc)
         return safe_short(text or title)
 
-# ---- Summaries (robust) ----
-def robust_llm_summary(client: OpenAI, text: str, title: str, url: str, date: dt.date) -> str:
+# ---- Summaries ----
+def robust_llm_summary(client: OpenAI, text: str, title: str, url: str, date: dt.datetime) -> str:
     if not text or not text.strip():
         return f"{title} — (could not extract text). Read more: {url}"
     prompt = (
@@ -452,6 +534,8 @@ NEW_MD_TEMPLATE = """# Weekly AI News Digest — {{ today.isoformat() }}
 
 What happened in the last {{ window_days }} days?
 
+**Jump to:** • {% for sec, items in sections.items() if items %}[{{ sec }}](#{{ sec|slug }}) • {% endfor %}
+
 {% for sec, items in sections.items() if items %}
 ## {{ sec }}
 {% for it in items %}
@@ -467,18 +551,17 @@ def main() -> None:
     feeds = normalize_feeds(feeds)
     raw = collect_entries(feeds)
     logging.info("Fetched %d items", len(raw))
-    today = dt.date.today()
 
-    # Keep only items from the last RECENCY_WINDOW_DAYS days
-    cutoff = today - dt.timedelta(days=RECENCY_WINDOW_DAYS)
-    recent = [it for it in raw if it["date"] >= cutoff]
+    now = now_brussels()
+    today = now.date()
+    cutoff_dt = now - dt.timedelta(days=RECENCY_WINDOW_DAYS)
 
-    # Still sort by date and keep a reasonable cap
+    recent = [it for it in raw if it["date"] >= cutoff_dt]
+
     prelim = sorted(recent, key=lambda x: x["date"], reverse=True)[:200]
 
     deduped = cluster_and_pick(prelim)
 
-    # Extract text concurrently
     with ThreadPoolExecutor(max_workers=6) as ex:
         futures = {ex.submit(extract_text, it["link"]): it for it in deduped}
         for fut in tqdm(as_completed(futures), total=len(futures), desc="Extract"):
@@ -488,12 +571,11 @@ def main() -> None:
 
     buckets = defaultdict(list)
     for it in deduped:
-        it["score"] = rank_score(it, today)
+        it["score"] = rank_score(it, now)
         buckets[it["section"]].append(it)
     for sec in buckets:
         buckets[sec] = sorted(buckets[sec], key=lambda x: x["score"], reverse=True)[:MAX_PER_SECTION]
 
-    # Init OpenAI client from env, robustly
     api_key = os.getenv("OPENAI_API_KEY")
     base_url = os.getenv("OPENAI_BASE_URL")
     client = None
@@ -520,9 +602,13 @@ def main() -> None:
                 summ = robust_llm_summary(client, it["text"], it["title"], it["link"], it["date"])
             else:
                 summ = safe_short(it["text"] or it["title"])
-            it["bullet"] = f"{it['title']} ({it['date'].isoformat()}) — {summ} [{it['source']}]({it['link']})"
+            date_str = it["date"].date().isoformat()
+            it["bullet"] = f"{it['title']} ({date_str}) — {summ} [{it['source']}]({it['link']})"
 
-    tpl = Template(NEW_MD_TEMPLATE)
+    env = Environment(autoescape=False)
+    env.filters["slug"] = slugify
+
+    tpl = env.from_string(NEW_MD_TEMPLATE)
     md = tpl.render(today=today, sections=buckets, window_days=RECENCY_WINDOW_DAYS)
 
     os.makedirs("out", exist_ok=True)
@@ -531,8 +617,8 @@ def main() -> None:
         f.write(md)
     logging.info("Wrote %s", outfp)
 
-    # Mention the x-day window in the subject for clarity
     send_email(f"Weekly AI Digest {today.isoformat()} (last {RECENCY_WINDOW_DAYS} days)", md)
+
 
 if __name__ == "__main__":
     main()

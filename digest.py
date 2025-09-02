@@ -27,6 +27,11 @@ try:
     from requests.adapters import HTTPAdapter
 except Exception:
     requests = None
+from email.mime.multipart import MIMEMultipart
+try:
+    import markdown as mdlib
+except Exception:
+    mdlib = None
 
 # Load environment variables from .env file if present
 from dotenv import load_dotenv
@@ -194,7 +199,7 @@ def safe_short(text: str, n: int = 220) -> str:
     text = " ".join(text.split())
     return textwrap.shorten(text, width=n, placeholder="…")
 
-def send_email(subject: str, body: str) -> None:
+def send_email(subject: str, body_md: str) -> None:
     host = os.getenv("SMTP_HOST")
     port = int(os.getenv("SMTP_PORT", "587"))
     user = os.getenv("SMTP_USER")
@@ -210,20 +215,24 @@ def send_email(subject: str, body: str) -> None:
     to_addrs = parse_list(to_raw)
     cc_addrs = parse_list(cc_raw)
     bcc_addrs = parse_list(bcc_raw)
-
     recipients = to_addrs + cc_addrs + bcc_addrs
 
     if not all([host, user, pwd, from_addr]) or not recipients:
         logging.info("Email settings incomplete or no recipients; skipping mail send.")
         return
 
-    msg = MIMEText(body, "plain", "utf-8")
+    html_body = md_to_html(body_md)
+
+    msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = from_addr
-    if to_addrs:
-        msg["To"] = ", ".join(to_addrs)
-    if cc_addrs:
-        msg["Cc"] = ", ".join(cc_addrs)
+    if to_addrs: msg["To"] = ", ".join(to_addrs)
+    if cc_addrs: msg["Cc"] = ", ".join(cc_addrs)
+
+    part_text = MIMEText(body_md, "plain", "utf-8")
+    part_html = MIMEText(html_body, "html", "utf-8")
+    msg.attach(part_text)
+    msg.attach(part_html)
 
     try:
         with smtplib.SMTP(host, port) as smtp:
@@ -263,6 +272,43 @@ def wp_feed_fallback(url: str) -> str:
         pass
     return ""
 
+def md_to_html(md_text: str) -> str:
+    if mdlib:
+        body = mdlib.markdown(
+            md_text,
+            extensions=["tables", "fenced_code", "sane_lists", "toc"]
+        )
+    else:
+        import html, re
+        t = html.escape(md_text)
+        t = re.sub(r"^# (.+)$", r"<h1>\1</h1>", t, flags=re.MULTILINE)
+        t = re.sub(r"^## (.+)$", r"<h2>\1</h2>", t, flags=re.MULTILINE)
+        t = re.sub(r"^### (.+)$", r"<h3>\1</h3>", t, flags=re.MULTILINE)
+        t = re.sub(r"^(?:- |\* )(.*)$", r"<li>\1</li>", t, flags=re.MULTILINE)
+        t = re.sub(r"(?:<li>.*</li>\n?)+", lambda m: "<ul>\n"+m.group(0)+"\n</ul>", t)
+        t = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', t)
+        body = "<p>" + t.replace("\n\n", "</p><p>").replace("\n", "<br>") + "</p>"
+
+    return f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+body {{ font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; line-height:1.5; color:#111; }}
+h1 {{ font-size:20px; margin:0 0 12px; }}
+h2 {{ font-size:16px; margin:18px 0 8px; border-bottom:1px solid #eee; padding-bottom:4px; }}
+h3 {{ font-size:14px; margin:14px 0 6px; }}
+ul {{ padding-left:20px; }}
+a {{ color:#0b57d0; text-decoration:none; }}
+a:hover {{ text-decoration:underline; }}
+code, pre {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:#f6f8fa; padding:2px 4px; border-radius:4px; }}
+.container {{ max-width:820px; margin:0 auto; }}
+</style>
+</head>
+<body><div class="container">
+{body}
+</div></body>
+</html>"""
 
 # ---- Ingest ----
 def collect_entries(feeds: List[str]) -> List[Dict]:

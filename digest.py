@@ -1,4 +1,4 @@
-import os
+﻿import os
 import re
 import hashlib
 import textwrap
@@ -27,6 +27,10 @@ try:
     from requests.adapters import HTTPAdapter
 except Exception:
     requests = None
+
+# Load environment variables from .env file if present
+from dotenv import load_dotenv
+load_dotenv()
 
 # ---- Settings ----
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -91,9 +95,13 @@ def _build_session():
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
     })
-    retry = Retry(total=2, backoff_factor=0.4,
-                  status_forcelist=(429, 500, 502, 503, 504),
-                  allowed_methods=("GET", "HEAD"), raise_on_status=False)
+    retry = Retry(
+        total=2,
+        backoff_factor=0.4,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET", "HEAD"}),
+        raise_on_status=False,
+    )
     adapter = HTTPAdapter(max_retries=retry, pool_connections=30, pool_maxsize=30)
     sess.mount("http://", adapter)
     sess.mount("https://", adapter)
@@ -106,7 +114,7 @@ def _fetch_html(url: str) -> str:
         try:
             r = HTTP.get(url, timeout=15)
             if r.status_code != 200:
-                logging.error("not a 200 response: %s for URL %s", r.status_code, url)
+                logging.error("Non-200 response: %s for URL %s", r.status_code, url)
                 return ""
             return r.text
         except Exception as exc:
@@ -268,14 +276,14 @@ def cluster_and_pick(items: List[Dict]) -> List[Dict]:
 # ---- Summaries ----
 def llm_summary(client: OpenAI, text: str, title: str, url: str, date: dt.date) -> str:
     if not text.strip():
-        return f"{title} — (Geen tekst kunnen extraheren). Lees meer: {url}"
-    prompt = f"""Vat dit nieuws SAMENVATTEND samen in 2 zinnen (NL), met 1 emoji die het thema past.
-Geef concrete cijfers/data indien in de tekst aanwezig. Noem expliciet de datum ({date.isoformat()}) en eindig met een korte duiding in 5–8 woorden.
-Baseer je uitsluitend op onderstaande tekst en hallucineer niet.
-Titel: {title}
+        return f"{title} — (Could not extract text). Read more: {url}"
+    prompt = f"""Summarize this news in exactly 2 concise sentences (EN). Include 1 fitting emoji.
+If the text contains concrete numbers/dates, include them. Explicitly name the date ({date.isoformat()}) and end with a short 5–8 word take-away.
+Rely only on the text below. Do not hallucinate.
+Title: {title}
 URL: {url}
 
-TEKST:
+TEXT:
 {text[:6000]}"""
     try:
         resp = client.chat.completions.create(
@@ -286,7 +294,31 @@ TEKST:
         )
         return resp.choices[0].message.content.strip()
     except Exception as exc:
-        logging.warning("LLM summarisation failed: %s", exc)
+        logging.warning("LLM summarization failed: %s", exc)
+        return safe_short(text or title)
+
+# ---- Summaries (robust) ----
+def robust_llm_summary(client: OpenAI, text: str, title: str, url: str, date: dt.date) -> str:
+    if not text or not text.strip():
+        return f"{title} — (could not extract text). Read more: {url}"
+    prompt = (
+        "Summarize this news in exactly 2 concise sentences (EN) and include 1 fitting emoji.\n"
+        f"Explicitly name the date ({date.isoformat()}) and end with a short 5–8 word take-away.\n"
+        "Rely only on the text below. Do not hallucinate.\n"
+        f"Title: {title}\n"
+        f"URL: {url}\n\nTEXT:\n{text[:6000]}"
+    )
+    try:
+        resp = client.chat.completions.create(
+            model=os.getenv("OPENAI_SUMMARY_MODEL", "gpt-4o-mini"),
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=180,
+        )
+        content = resp.choices[0].message.content or ""
+        return content.strip() or safe_short(text or title)
+    except Exception as exc:
+        logging.warning("LLM summarization failed: %s", exc)
         return safe_short(text or title)
 
 # ---- Render ----
@@ -335,21 +367,25 @@ def main() -> None:
     for sec in buckets:
         buckets[sec] = sorted(buckets[sec], key=lambda x: x["score"], reverse=True)[:MAX_PER_SECTION]
 
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if os.getenv("OPENAI_API_KEY") else None
+    # Init OpenAI client from env, robustly
+    api_key = os.getenv("OPENAI_API_KEY")
+    base_url = os.getenv("OPENAI_BASE_URL")
+    client = None
+    if api_key:
+        try:
+            client = OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
+        except Exception as exc:
+            logging.warning("Failed to init OpenAI client: %s", exc)
+            client = None
+
     for sec in buckets:
         for it in buckets[sec]:
             if client:
-                summ = llm_summary(client, it["text"], it["title"], it["link"], it["date"])
+                summ = robust_llm_summary(client, it["text"], it["title"], it["link"], it["date"])
             else:
                 summ = safe_short(it["text"] or it["title"])
             it["bullet"] = f"{it['title']} ({it['date'].isoformat()}) — {summ} [{it['source']}]({it['link']})"
-            it["bullet"] = f"{it['title']} ({it['date'].isoformat()}) — {summ} [{it['source']}]({it['link']})"
 
-    # ensure bullet format is clean (override any earlier assignment)
-    for sec in buckets:
-        for it in buckets[sec]:
-            if "bullet" in it:
-                it["bullet"] = f"{it['title']} ({it['date'].isoformat()}) — {it.get('bullet').split(')')[-1].strip()}"
     tpl = Template(NEW_MD_TEMPLATE)
     md = tpl.render(today=today, sections=buckets)
 

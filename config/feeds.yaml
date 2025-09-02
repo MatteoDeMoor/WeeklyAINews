@@ -1,9 +1,22 @@
 feeds:
-  - https://techcrunch.com/tag/ai/feed/
-  - https://www.anthropic.com/feed.xml
+  # Labs & vendors
   - https://openai.com/blog/rss.xml
-  - https://ai.googleblog.com/atom.xml
+  # - https://ai.googleblog.com/atom.xml
+  - https://blog.research.google/atom.xml
+  - https://www.microsoft.com/en-us/research/blog/category/artificial-intelligence/feed/
+  - https://blogs.nvidia.com/blog/category/ai/feed/
+  - https://huggingface.co/blog/feed.xml
+  # - https://www.anthropic.com/feed.xml
+
+  # Media
+  - https://techcrunch.com/tag/ai/feed/
   - https://www.theverge.com/rss/ai-artificial-intelligence/index.xml
-  - https://venturebeat.com/category/ai/feed/
-  - https://export.arxiv.org/rss/cs.CL
-  - https://export.arxiv.org/rss/cs.AI
+  # - https://venturebeat.com/category/ai/feed/
+  - https://arstechnica.com/information-technology/feed/
+
+  # Research
+  # - https://export.arxiv.org/rss/cs.AI
+  # - https://export.arxiv.org/rss/cs.CL
+  # - https://export.arxiv.org/rss/cs.LG
+  # - https://export.arxiv.org/rss/stat.ML
+  - https://www.nature.com/natmachintell.rss

@@ -8,3 +8,6 @@ PyYAML==6.0.2
 tqdm==4.66.5
 openai==1.46.0
 python-dotenv==1.0.1
+requests==2.32.3
+urllib3==2.2.2
+lxml==5.2.2

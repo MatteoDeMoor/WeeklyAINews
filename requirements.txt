@@ -1,0 +1,9 @@
+feedparser
+trafilatura
+sentence-transformers
+scikit-learn
+jinja2
+python-dateutil
+PyYAML
+tqdm
+openai

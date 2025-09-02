@@ -1,0 +1,9 @@
+feeds:
+  - https://techcrunch.com/tag/ai/feed/
+  - https://www.anthropic.com/feed.xml
+  - https://openai.com/blog/rss.xml
+  - https://ai.googleblog.com/atom.xml
+  - https://www.theverge.com/rss/ai-artificial-intelligence/index.xml
+  - https://venturebeat.com/category/ai/feed/
+  - https://export.arxiv.org/rss/cs.CL
+  - https://export.arxiv.org/rss/cs.AI

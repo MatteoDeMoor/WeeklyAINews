@@ -12,7 +12,6 @@ from dateutil import parser as dparser
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict
-
 from tqdm import tqdm
 import trafilatura
 from jinja2 import Template
@@ -35,6 +34,8 @@ load_dotenv()
 # ---- Settings ----
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 SIM_THRESHOLD = 0.86
+RECENCY_WINDOW_DAYS = 7
+
 SECTIONS = {
     "Model updates": r"(model|weights|gpt|gemini|claude|mixtral|llama|blackwell|rtx|inference|realtime)",
     "New AI tools and features": r"(launch|update|feature|plugin|extension|beta|preview|app|notebooklm|translate|editor|vids)",
@@ -43,8 +44,8 @@ SECTIONS = {
 }
 MAX_PER_SECTION = 8
 
+# ---- Logging ----
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(message)s")
-# reduce noisy third-party logs
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("trafilatura").setLevel(logging.WARNING)
 
@@ -149,7 +150,8 @@ def categorize(title: str, text: str) -> str:
 
 def rank_score(item: Dict, today: dt.date) -> float:
     days = max(0, (today - item["date"]).days)
-    recency = max(0.0, 1.0 - min(days, 14) / 14.0)
+    # Use the 8-day window for recency scaling.
+    recency = max(0.0, 1.0 - min(days, RECENCY_WINDOW_DAYS) / float(RECENCY_WINDOW_DAYS))
     trust = 1.0 if any(k in item["link"] for k in [
         "openai.com", "ai.googleblog", "anthropic.com", "techcrunch.com",
         "theverge.com", "venturebeat.com", "arxiv.org"
@@ -322,24 +324,17 @@ def robust_llm_summary(client: OpenAI, text: str, title: str, url: str, date: dt
         return safe_short(text or title)
 
 # ---- Render ----
-MD_TEMPLATE = """Weekly AI News Digest — {{ today.isoformat() }}
+NEW_MD_TEMPLATE = """# Weekly AI News Digest — {{ today.isoformat() }}
+
+_What happened in the last {{ window_days }} days._
 
 {% for sec, items in sections.items() if items %}
-- {{ sec }}
-{% for it in items %}
-{{ it['bullet'] }}
-{% endfor %}
-{% endfor %}
-"""
-
-# Newer, cleaner Markdown template (keeps old for compatibility)
-NEW_MD_TEMPLATE = """Weekly AI News Digest — {{ today.isoformat() }}
-
-{% for sec, items in sections.items() if items %}
-**{{ sec }}**
+## {{ sec }}
 {% for it in items %}
 - {{ it['bullet'] }}
 {% endfor %}
+
+---
 {% endfor %}
 """
 
@@ -348,7 +343,13 @@ def main() -> None:
     raw = collect_entries(feeds)
     logging.info("Fetched %d items", len(raw))
     today = dt.date.today()
-    prelim = sorted(raw, key=lambda x: x["date"], reverse=True)[:200]
+
+    # Keep only items from the last RECENCY_WINDOW_DAYS days
+    cutoff = today - dt.timedelta(days=RECENCY_WINDOW_DAYS)
+    recent = [it for it in raw if it["date"] >= cutoff]
+
+    # Still sort by date and keep a reasonable cap
+    prelim = sorted(recent, key=lambda x: x["date"], reverse=True)[:200]
 
     deduped = cluster_and_pick(prelim)
 
@@ -387,7 +388,7 @@ def main() -> None:
             it["bullet"] = f"{it['title']} ({it['date'].isoformat()}) — {summ} [{it['source']}]({it['link']})"
 
     tpl = Template(NEW_MD_TEMPLATE)
-    md = tpl.render(today=today, sections=buckets)
+    md = tpl.render(today=today, sections=buckets, window_days=RECENCY_WINDOW_DAYS)
 
     os.makedirs("out", exist_ok=True)
     outfp = f"out/digest_{today.isoformat()}.md"
@@ -395,7 +396,8 @@ def main() -> None:
         f.write(md)
     logging.info("Wrote %s", outfp)
 
-    send_email(f"Weekly AI Digest {today.isoformat()}", md)
+    # Mention the x-day window in the subject for clarity
+    send_email(f"Weekly AI Digest {today.isoformat()} (last {RECENCY_WINDOW_DAYS} days)", md)
 
 if __name__ == "__main__":
     main()

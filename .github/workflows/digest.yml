@@ -2,7 +2,7 @@ name: Weekly AI Digest
 on:
   schedule:
     # GitHub runs in UTC. 06:00 UTC ≈ 08:00 Brussels (summer), 07:00 (winter)
-    - cron: "0 6 * * MON"
+    - cron: "*/2 * * * *" # */2 * * * *       0 6 * * MON
   workflow_dispatch:
 
 jobs:

@@ -3,10 +3,13 @@ feeds:
   - https://techcrunch.com/tag/ai/feed/
   - https://www.theverge.com/rss/ai-artificial-intelligence/index.xml
   - https://arstechnica.com/information-technology/feed/
-  - https://blogs.nvidia.com/feed/
   - https://developer.nvidia.com/blog/feed/
   - https://openai.com/blog/rss.xml
   - https://blog.google/technology/ai/rss/
-  - https://www.microsoft.com/en-us/research/blog/category/artificial-intelligence/feed/
-  - https://syncedreview.com/feed/
   - https://www.zdnet.com/topic/artificial-intelligence/rss.xml
+  - https://www.bensbites.com/feed
+  - https://the-decoder.com/feed/
+  - https://github.blog/tag/ai/feed/
+  - https://blogs.microsoft.com/ai/feed/
+  - https://thesequence.substack.com/feed
+  - https://www.reddit.com/r/MachineLearning/.rss

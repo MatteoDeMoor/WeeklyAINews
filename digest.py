@@ -43,6 +43,8 @@ EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 SIM_THRESHOLD = 0.86
 RECENCY_WINDOW_DAYS = 7
 MAX_PER_SECTION = 8
+INCLUDE_ALL_RECENT = True
+DISABLE_CLUSTERING = False
 
 SECTIONS = {
     "Model updates": r"(model|weights|gpt|gemini|claude|mixtral|llama|blackwell|rtx|inference|realtime)",
@@ -560,7 +562,10 @@ def main() -> None:
 
     prelim = sorted(recent, key=lambda x: x["date"], reverse=True)[:200]
 
-    deduped = cluster_and_pick(prelim)
+    if INCLUDE_ALL_RECENT or DISABLE_CLUSTERING:
+        deduped = prelim
+    else:
+        deduped = cluster_and_pick(prelim)
 
     with ThreadPoolExecutor(max_workers=6) as ex:
         futures = {ex.submit(extract_text, it["link"]): it for it in deduped}
@@ -571,10 +576,14 @@ def main() -> None:
 
     buckets = defaultdict(list)
     for it in deduped:
-        it["score"] = rank_score(it, now)
+        if not INCLUDE_ALL_RECENT:
+            it["score"] = rank_score(it, now)
         buckets[it["section"]].append(it)
     for sec in buckets:
-        buckets[sec] = sorted(buckets[sec], key=lambda x: x["score"], reverse=True)[:MAX_PER_SECTION]
+        if INCLUDE_ALL_RECENT:
+            buckets[sec] = sorted(buckets[sec], key=lambda x: x["date"], reverse=True)
+        else:
+            buckets[sec] = sorted(buckets[sec], key=lambda x: x["score"], reverse=True)[:MAX_PER_SECTION]
 
     api_key = os.getenv("OPENAI_API_KEY")
     base_url = os.getenv("OPENAI_BASE_URL")

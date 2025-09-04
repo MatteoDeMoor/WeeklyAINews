@@ -53,9 +53,9 @@ OPENAI_ANNOTATE_MODEL = "gpt-4o-mini"
 
 SECTIONS = {
     "Investments & Business": r"\b(raise|funding|series [a-f]|valuation|revenue|earnings|acquir\w+|merger|partnership|deal|ipo|stake|cto|leadership)\b",
-    "Ethical & Privacy": r"\b(privacy|copyright|lawsuit|policy|regulat\w+|safety|guardrail|misuse|security|breach|teen|age[- ]verification|compliance|dsar|gdpr)\b",
+    "Ethical & Privacy": r"\b(privacy|copyright|lawsuit|regulat\w+|gdpr|dsar|breach|security|age[- ]verification|teen|child(?:ren)?(?:'s)?|minor[s]?|compliance|data (?:protection|privacy)|content moderation|online safety|ai (?:safety|policy)|policy (?:on|for) ai)\b",
     "New AI tools and features": r"\b(launch\w*|releas\w*|introduc\w*|unveil\w*|feature|update|beta|preview|app|plugin|extension|notebooklm|editor|translate|vids)\b",
-    "Model updates": r"\b(llm|gpt|gemini|claude|llama|mistral|mixtral|weights?|checkpoint|inference|latency|throughput|benchmark|cuda|kernel|quantization|qat|sft|realtime)\b",
+    "Model updates": r"\b(llm|gpt|gemini|claude|llama|mistral|mixtral|weights?|checkpoint|inference|latency|throughput|benchmark|cuda|kernel|quantization|qat|sft|realtime|embedding|gemma)\b",
 }
 ALLOWED_SECTIONS = list(SECTIONS.keys())
 
@@ -92,12 +92,12 @@ def save_cache(cache):
 def sanity_bounce(it):
     txt = (it["title"] + " " + it.get("text","")).lower()
     sec = it["section"]
-    if sec != "Investments & Business" and re.search(
-        r"\b(funding|raise|series [a-f]|acquisit|merger|ipo|valuation|earnings|revenue)\b", txt
-    ):
+    if sec != "Investments & Business" and re.search(r"\b(funding|raise|series [a-f]|acquisit|merger|ipo|valuation|earnings|revenue)\b", txt):
         it["section"] = "Investments & Business"
+
     if sec != "Ethical & Privacy" and re.search(
-        r"\b(privacy|security|breach|gdpr|policy|regulat|lawsuit|age[- ]verification|teen)\b", txt
+        r"\b(privacy|security|breach|gdpr|copyright|lawsuit|regulat\w+|dsar|age[- ]verification|teen|child|minor|content moderation|online safety|ai (?:safety|policy)|policy (?:on|for) ai)\b",
+        txt
     ):
         it["section"] = "Ethical & Privacy"
 

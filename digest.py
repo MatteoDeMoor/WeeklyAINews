@@ -43,13 +43,12 @@ EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 SIM_THRESHOLD = 0.86
 RECENCY_WINDOW_DAYS = 7
 MAX_PER_SECTION = 8
+PER_SOURCE_LIMIT = 8
+PER_SOURCE_PER_SECTION_LIMIT = 3
 INCLUDE_ALL_RECENT = True
 DISABLE_CLUSTERING = False
-PER_SOURCE_LIMIT = 8
 ENABLE_AI_RELEVANCE = True
-OPENAI_CATEGORIZE = False
 OPENAI_ANNOTATE = True
-PER_SOURCE_PER_SECTION_LIMIT = 3
 OPENAI_ANNOTATE_MODEL = "gpt-4o-mini"
 
 SECTIONS = {
@@ -261,7 +260,7 @@ def ai_relevance_heuristic(title: str, text: str) -> float:
 DOMAIN_TRUST = {
     "openai.com": 1.0,
     "blog.google": 0.9,          # product/AI posts
-    "ai.googleblog.com": 1.0,    # research blog (als je die later toevoegt)
+    "ai.googleblog.com": 1.0,    # research blog
     "developer.nvidia.com": 1.0,
     "techcrunch.com": 0.8,
     "theverge.com": 0.7,
@@ -269,7 +268,9 @@ DOMAIN_TRUST = {
     "github.blog": 0.8,
     "blogs.microsoft.com": 0.8,
     "zdnet.com": 0.6,
-    "substack.com": 0.6,         # thesequence
+    "substack.com": 0.6,
+    "thesequence.substack.com": 0.6,
+    "substack.com": 0.6,
 }
 
 def rank_score(item: Dict, now_bxl: dt.datetime) -> float:

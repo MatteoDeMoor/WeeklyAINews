@@ -45,13 +45,20 @@ RECENCY_WINDOW_DAYS = 7
 MAX_PER_SECTION = 8
 INCLUDE_ALL_RECENT = True
 DISABLE_CLUSTERING = False
+PER_SOURCE_LIMIT = 8
+ENABLE_AI_RELEVANCE = True
+OPENAI_CATEGORIZE = False
+OPENAI_ANNOTATE = True
+PER_SOURCE_PER_SECTION_LIMIT = 3
+OPENAI_ANNOTATE_MODEL = "gpt-4o-mini"
 
 SECTIONS = {
-    "Model updates": r"(model|weights|gpt|gemini|claude|mixtral|llama|blackwell|rtx|inference|realtime)",
-    "New AI tools and features": r"(launch|update|feature|plugin|extension|beta|preview|app|notebooklm|translate|editor|vids)",
-    "Investments & Business": r"(raise|funding|series|revenue|acquire|merger|partnership|deal|ipo|earnings|stake)",
-    "Ethical & Privacy": r"(privacy|copyright|lawsuit|policy|safety|guardrail|misuse|security|breach|teen|compliance|dsar|gdpr)"
+    "Investments & Business": r"\b(raise|funding|series [a-f]|valuation|revenue|earnings|acquir\w+|merger|partnership|deal|ipo|stake|cto|leadership)\b",
+    "Ethical & Privacy": r"\b(privacy|copyright|lawsuit|policy|regulat\w+|safety|guardrail|misuse|security|breach|teen|age[- ]verification|compliance|dsar|gdpr)\b",
+    "New AI tools and features": r"\b(launch\w*|releas\w*|introduc\w*|unveil\w*|feature|update|beta|preview|app|plugin|extension|notebooklm|editor|translate|vids)\b",
+    "Model updates": r"\b(llm|gpt|gemini|claude|llama|mistral|mixtral|weights?|checkpoint|inference|latency|throughput|benchmark|cuda|kernel|quantization|qat|sft|realtime)\b",
 }
+ALLOWED_SECTIONS = list(SECTIONS.keys())
 
 SKIP_EXTRACT_HOSTS = {
     "openai.com", "medium.com", "bloomberg.com", "wsj.com",
@@ -64,6 +71,37 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("trafilatura").setLevel(logging.WARNING)
 
 # ---- Utils ----
+CACHE_FP = ".cache/annotate.json"
+
+def load_cache():
+    os.makedirs(os.path.dirname(CACHE_FP), exist_ok=True)
+    try:
+        import json
+        with open(CACHE_FP, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_cache(cache):
+    try:
+        import json
+        with open(CACHE_FP, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        logging.warning("Failed to save cache: %s", exc)
+
+def sanity_bounce(it):
+    txt = (it["title"] + " " + it.get("text","")).lower()
+    sec = it["section"]
+    if sec != "Investments & Business" and re.search(
+        r"\b(funding|raise|series [a-f]|acquisit|merger|ipo|valuation|earnings|revenue)\b", txt
+    ):
+        it["section"] = "Investments & Business"
+    if sec != "Ethical & Privacy" and re.search(
+        r"\b(privacy|security|breach|gdpr|policy|regulat|lawsuit|age[- ]verification|teen)\b", txt
+    ):
+        it["section"] = "Ethical & Privacy"
+
 def now_brussels() -> dt.datetime:
     return dt.datetime.now(ZoneInfo("Europe/Brussels"))
 
@@ -193,14 +231,52 @@ def categorize(title: str, text: str) -> str:
             return sec
     return "New AI tools and features"
 
+def ai_relevance_heuristic(title: str, text: str) -> float:
+    """Simple keyword-based AI relevance score in [0,1]."""
+    blob = (title + "\n" + (text or "")).lower()
+    keywords = {
+        # core AI models/infra
+        "gpt": 1.0, "llm": 0.9, "llms": 0.9, "gemini": 0.9, "claude": 0.9, "llama": 0.9,
+        "mistral": 0.8, "mixtral": 0.8, "transformer": 0.8, "inference": 0.7,
+        # companies
+        "openai": 0.9, "anthropic": 0.8, "deepmind": 0.8, "hugging face": 0.8,
+        # domains
+        "ai ": 0.8, " artificial intelligence": 0.9, "machine learning": 0.8, "ml ": 0.7,
+        # use-cases/features
+        "copilot": 0.7, "assistants": 0.6, "r1": 0.7, "multimodal": 0.7, "prompt": 0.6,
+        # safety/policy
+        "ai safety": 0.7, "alignment": 0.6, "copyright": 0.5, "policy": 0.5,
+    }
+    score = 0.0
+    for k, w in keywords.items():
+        if k in blob:
+            score += w
+    # normalize: rough cap and scale
+    score = min(score, 6.0) / 6.0
+    # small boost if title seems strongly AI-ish
+    if any(x in title.lower() for x in ["ai", "gpt", "llm", "gemini", "claude", "llama", "mistral"]):
+        score = min(1.0, score + 0.15)
+    return max(0.0, min(1.0, score))
+
+DOMAIN_TRUST = {
+    "openai.com": 1.0,
+    "blog.google": 0.9,          # product/AI posts
+    "ai.googleblog.com": 1.0,    # research blog (als je die later toevoegt)
+    "developer.nvidia.com": 1.0,
+    "techcrunch.com": 0.8,
+    "theverge.com": 0.7,
+    "huggingface.co": 0.9,
+    "github.blog": 0.8,
+    "blogs.microsoft.com": 0.8,
+    "zdnet.com": 0.6,
+    "substack.com": 0.6,         # thesequence
+}
+
 def rank_score(item: Dict, now_bxl: dt.datetime) -> float:
     delta_days = max(0.0, (now_bxl - item["date"]).total_seconds() / 86400.0)
     recency = max(0.0, 1.0 - min(delta_days, float(RECENCY_WINDOW_DAYS)) / float(RECENCY_WINDOW_DAYS))
-
-    trust = 1.0 if any(k in item["link"] for k in [
-        "openai.com", "ai.googleblog", "anthropic.com", "techcrunch.com",
-        "theverge.com", "venturebeat.com", "zdnet.com",
-    ]) else 0.5
+    host = item.get("source","").lower()
+    trust = DOMAIN_TRUST.get(host, 0.5)
     novelty = float(item.get("novelty", 0.7))
     return 0.45 * recency + 0.35 * trust + 0.20 * novelty
 
@@ -531,20 +607,94 @@ def robust_llm_summary(client: OpenAI, text: str, title: str, url: str, date: dt
         logging.warning("LLM summarization failed: %s", exc)
         return safe_short(text or title)
 
+def llm_annotate(client: OpenAI, text: str, title: str, url: str, date: dt.datetime) -> Dict:
+    allowed = ALLOWED_SECTIONS
+    snippet = (text or "")[:6000]
+
+    system = (
+        "Classify AI news into exactly one of 4 sections:\n"
+        "1) Model updates — research/models/infra/perf (LLMs, CUDA, kernels, inference, benchmarks, training).\n"
+        "2) New AI tools and features — product launches/feature updates/apps for users/devs.\n"
+        "3) Investments & Business — funding/valuation/revenue/earnings/IPO/M&A/leadership/partnerships/lawsuits over trade secrets.\n"
+        "4) Ethical & Privacy — privacy/security/breach/laws/policy/regulation/guardrails/teen safety/age verification/copyright.\n"
+        "Tie-break rules:\n"
+        "- If funding/IPO/M&A present → Investments & Business (even if 'model' appears).\n"
+        "- If privacy/security/law/age verification/teen safety present → Ethical & Privacy.\n"
+        "- If product features/launch without the above → New AI tools and features.\n"
+        "- Else if research/infra/perf → Model updates.\n"
+        "Answer using the schema. No extra text."
+    )
+
+    user = (
+        f"Title: {title}\nURL: {url}\nDate: {date.isoformat()}\n\n"
+        f"TEXT:\n{snippet}"
+    )
+
+    schema = {
+        "name": "news_annotation",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "category": {"type": "string", "enum": allowed},
+                "relevance": {"type": "number", "minimum": 0, "maximum": 1},
+                "summary": {"type": "string"}
+            },
+            "required": ["category","relevance","summary"],
+            "additionalProperties": False
+        },
+        "strict": True
+    }
+
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_ANNOTATE_MODEL,
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": user}],
+            temperature=0.1,
+            max_tokens=220,
+            response_format={"type": "json_schema", "json_schema": schema}
+        )
+        import json
+        data = json.loads(resp.choices[0].message.content or "{}")
+        cat = str(data.get("category") or "").strip()
+        if cat not in allowed:
+            cat = categorize(title, text)
+        rel = float(data.get("relevance", 0.0))
+        rel = max(0.0, min(1.0, rel))
+        summ = (data.get("summary") or "").strip()
+        return {"category": cat, "relevance": rel, "summary": summ}
+    except Exception as exc:
+        logging.warning("LLM annotate failed: %s", exc)
+        return {
+            "category": categorize(title, text),
+            "relevance": ai_relevance_heuristic(title, text),
+            "summary": safe_short(text or title),
+        }
+
 # ---- Render ----
 NEW_MD_TEMPLATE = """# Weekly AI News Digest — {{ today.isoformat() }}
 
 What happened in the last {{ window_days }} days?
 
-**Jump to:** • {% for sec, items in sections.items() if items %}[{{ sec }}](#{{ sec|slug }}) • {% endfor %}
+{% set heads = [] %}
+{% for sec in allowed_sections %}
+  {% set items = sections.get(sec, []) %}
+  {% if items %}
+    {% set _ = heads.append('[' ~ sec ~ '](#' ~ (sec|slug) ~ ')') %}
+  {% endif %}
+{% endfor %}
+**Jump to:** {{ heads | join(' • ') }}
 
-{% for sec, items in sections.items() if items %}
+{% for sec in allowed_sections %}
+  {% set items = sections.get(sec, []) %}
+  {% if items %}
 ## {{ sec }}
 {% for it in items %}
 - {{ it['bullet'] }}
 {% endfor %}
 
 ---
+  {% endif %}
 {% endfor %}
 """
 
@@ -567,24 +717,14 @@ def main() -> None:
     else:
         deduped = cluster_and_pick(prelim)
 
+    # Extract article text in parallel
     with ThreadPoolExecutor(max_workers=6) as ex:
         futures = {ex.submit(extract_text, it["link"]): it for it in deduped}
         for fut in tqdm(as_completed(futures), total=len(futures), desc="Extract"):
             it = futures[fut]
             it["text"] = fut.result() or it.get("desc", "")
-            it["section"] = categorize(it["title"], it["text"])
 
-    buckets = defaultdict(list)
-    for it in deduped:
-        if not INCLUDE_ALL_RECENT:
-            it["score"] = rank_score(it, now)
-        buckets[it["section"]].append(it)
-    for sec in buckets:
-        if INCLUDE_ALL_RECENT:
-            buckets[sec] = sorted(buckets[sec], key=lambda x: x["date"], reverse=True)
-        else:
-            buckets[sec] = sorted(buckets[sec], key=lambda x: x["score"], reverse=True)[:MAX_PER_SECTION]
-
+    # Prepare OpenAI client early if needed for annotation/summaries
     api_key = os.getenv("OPENAI_API_KEY")
     base_url = os.getenv("OPENAI_BASE_URL")
     client = None
@@ -605,20 +745,105 @@ def main() -> None:
             logging.warning("Failed to init OpenAI client: %s", exc)
             client = None
 
+    # Annotate items: category + AI relevance (optionally via LLM)
+    cache = load_cache()
+
+    if OPENAI_ANNOTATE and client:
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            futs = {}
+            for it in deduped:
+                key = it["id"]  # sha(link)
+                if key in cache:
+                    data = cache[key] or {}
+                    cat = (data.get("category") or "").strip()
+                    if cat not in ALLOWED_SECTIONS:
+                        cat = categorize(it["title"], it.get("text",""))
+                        data["category"] = cat
+                        cache[key] = data  # corrigeer cache
+
+                    rel = float(data.get("relevance", 0.0))
+                    rel = max(0.0, min(1.0, rel))  # clamp
+
+                    it["section"] = cat
+                    it["ai_relevance"] = rel
+                    it["summary_override"] = data.get("summary") or None
+                    sanity_bounce(it)
+                else:
+                    futs[ex.submit(llm_annotate, client, it.get("text",""), it["title"], it["link"], it["date"])] = it
+
+            for fut in tqdm(as_completed(futs), total=len(futs), desc="Annotate"):
+                it = futs[fut]
+                data = fut.result() or {}
+                it["section"] = data.get("category") or categorize(it["title"], it.get("text",""))
+                it["ai_relevance"] = float(data.get("relevance", 0.0))
+                it["summary_override"] = data.get("summary") or None
+                sanity_bounce(it)
+                cache[it["id"]] = data
+
+        save_cache(cache)
+    else:
+        for it in deduped:
+            it["section"] = categorize(it["title"], it.get("text",""))
+            it["ai_relevance"] = ai_relevance_heuristic(it["title"], it.get("text","")) if ENABLE_AI_RELEVANCE else 0.5
+            sanity_bounce(it)
+            
+    # Per-source capping: keep top-N per source by AI relevance then recency
+    if PER_SOURCE_LIMIT > 0:
+        by_src = defaultdict(list)
+        for it in deduped:
+            by_src[it["source"]].append(it)
+        kept = []
+        for src, arr in by_src.items():
+            arr_sorted = sorted(arr, key=lambda x: (-(x.get("ai_relevance", 0.0)), -x["date"].timestamp()))
+            kept.extend(arr_sorted[:PER_SOURCE_LIMIT])
+        deduped = kept
+
+    # Per (section, source) capping: max-N per bron binnen elk thema
+    if PER_SOURCE_PER_SECTION_LIMIT > 0:
+        by_pair = defaultdict(list)
+        for it in deduped:
+            key = (it["section"], it["source"])
+            by_pair[key].append(it)
+
+        kept2 = []
+        for (sec, src), arr in by_pair.items():
+            arr_sorted = sorted(
+                arr,
+                key=lambda x: (-(x.get("ai_relevance", 0.0)), -x["date"].timestamp())
+            )
+            kept2.extend(arr_sorted[:PER_SOURCE_PER_SECTION_LIMIT])
+
+        deduped = kept2
+
+    # Build buckets and ranking
+    buckets = defaultdict(list)
+    for it in deduped:
+        if not INCLUDE_ALL_RECENT:
+            it["score"] = rank_score(it, now)
+        buckets[it["section"]].append(it)
+    for sec in list(buckets.keys()):
+        if INCLUDE_ALL_RECENT:
+            buckets[sec] = sorted(buckets[sec], key=lambda x: x["date"], reverse=True)
+        else:
+            buckets[sec] = sorted(buckets[sec], key=lambda x: x["score"], reverse=True)[:MAX_PER_SECTION]
+
+    # Summaries (use annotation summary if available)
     for sec in buckets:
         for it in buckets[sec]:
-            if client:
-                summ = robust_llm_summary(client, it["text"], it["title"], it["link"], it["date"])
+            if it.get("summary_override"):
+                summ = it["summary_override"]
+            elif client:
+                summ = robust_llm_summary(client, it.get("text", ""), it["title"], it["link"], it["date"])
             else:
-                summ = safe_short(it["text"] or it["title"])
+                summ = safe_short(it.get("text", "") or it["title"])
             date_str = it["date"].date().isoformat()
-            it["bullet"] = f"{it['title']} ({date_str}) — {summ} [{it['source']}]({it['link']})"
+            it["bullet"] = f"{it['title']} ({date_str}) - {summ} [{it['source']}]({it['link']})"
 
     env = Environment(autoescape=False)
     env.filters["slug"] = slugify
 
     tpl = env.from_string(NEW_MD_TEMPLATE)
-    md = tpl.render(today=today, sections=buckets, window_days=RECENCY_WINDOW_DAYS)
+    md = tpl.render(today=today, sections=buckets, window_days=RECENCY_WINDOW_DAYS, allowed_sections=ALLOWED_SECTIONS)
 
     os.makedirs("out", exist_ok=True)
     outfp = f"out/digest_{today.isoformat()}.md"

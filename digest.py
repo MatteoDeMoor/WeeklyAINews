@@ -706,7 +706,15 @@ def main() -> None:
     logging.info("Fetched %d items", len(raw))
 
     now = now_brussels()
-    today = now.date()
+    date_override = os.getenv("DIGEST_DATE", "").strip()
+    if date_override:
+        try:
+            today = dt.date.fromisoformat(date_override)
+        except Exception:
+            logging.warning("Invalid DIGEST_DATE=%s, falling back to today", date_override)
+            today = now.date()
+    else:
+        today = now.date()
     cutoff_dt = now - dt.timedelta(days=RECENCY_WINDOW_DAYS)
 
     recent = [it for it in raw if it["date"] >= cutoff_dt]
@@ -846,8 +854,9 @@ def main() -> None:
     tpl = env.from_string(NEW_MD_TEMPLATE)
     md = tpl.render(today=today, sections=buckets, window_days=RECENCY_WINDOW_DAYS, allowed_sections=ALLOWED_SECTIONS)
 
-    os.makedirs("out", exist_ok=True)
-    outfp = f"out/digest_{today.isoformat()}.md"
+    out_dir = os.getenv("DIGEST_OUT_DIR", "out")
+    os.makedirs(out_dir, exist_ok=True)
+    outfp = os.path.join(out_dir, f"digest_{today.isoformat()}.md")
     with open(outfp, "w", encoding="utf-8") as f:
         f.write(md)
     logging.info("Wrote %s", outfp)

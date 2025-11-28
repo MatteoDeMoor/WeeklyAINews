@@ -1,5 +1,7 @@
-﻿import os
+import os
 import re
+import json
+import time
 import yaml
 import logging
 import smtplib
@@ -64,10 +66,56 @@ SKIP_EXTRACT_HOSTS = {
     "ft.com", "nytimes.com"
 }
 
+TRANSIENT_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+FETCH_RETRY_ATTEMPTS = 3
+BACKOFF_BASE_SECONDS = 1.0
+CIRCUIT_BREAK_THRESHOLD = 4
+
+INGEST_REPORT = {
+    "feeds_skipped": [],
+    "fetch_failures": [],
+    "extract_failures": [],
+}
+
+HOST_FAILURES = defaultdict(int)
+
+
+def is_transient_status(status: int) -> bool:
+    return status in TRANSIENT_STATUSES
+
+
+def log_event(level: int, message: str, **event) -> None:
+    extra = {"event": event} if event else None
+    logger.log(level, message, extra=extra)
+
 # ---- Logging ----
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(message)s")
-logging.getLogger("urllib3").setLevel(logging.WARNING)
-logging.getLogger("trafilatura").setLevel(logging.WARNING)
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        base = {
+            "time": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        event = getattr(record, "event", None)
+        if isinstance(event, dict):
+            base.update(event)
+        if record.exc_info:
+            base["exc_info"] = self.formatException(record.exc_info)
+        return json.dumps(base, ensure_ascii=False)
+
+
+def setup_logging() -> logging.Logger:
+    handler = logging.StreamHandler()
+    handler.setFormatter(JsonFormatter())
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("trafilatura").setLevel(logging.WARNING)
+    return logging.getLogger("digest")
+
+
+logger = setup_logging()
 
 # ---- Utils ----
 CACHE_FP = ".cache/annotate.json"
@@ -189,34 +237,108 @@ def _build_session():
 HTTP = _build_session()
 
 def _fetch_html(url: str) -> str:
+    host = host_of(url)
+    if host and HOST_FAILURES[host] >= CIRCUIT_BREAK_THRESHOLD:
+        log_event(logging.WARNING, "circuit_breaker_open", url=url, host=host, failures=HOST_FAILURES[host])
+        return ""
+
+    last_status = None
+    last_length = None
     if HTTP is not None:
-        try:
-            r = HTTP.get(url, timeout=15)
-            if r.status_code != 200:
-                level = logging.WARNING if r.status_code in (401, 403, 429) else logging.ERROR
-                logging.log(level, "Fetch %s returned %s", url, r.status_code)
-                return ""
-            return r.text
-        except Exception as exc:
-            logging.warning("requests fetch failed for %s: %s", url, exc)
-            return ""
+        for attempt in range(1, FETCH_RETRY_ATTEMPTS + 1):
+            try:
+                r = HTTP.get(url, timeout=15)
+                last_status = r.status_code
+                last_length = len(r.content or b"")
+                if r.status_code == 200:
+                    HOST_FAILURES[host] = 0
+                    return r.text
+
+                transient = is_transient_status(r.status_code)
+                level = logging.WARNING if transient else logging.ERROR
+                log_event(
+                    level,
+                    "fetch_http_status",
+                    url=url,
+                    host=host,
+                    status=r.status_code,
+                    transient=transient,
+                    attempt=attempt,
+                    retry_budget=FETCH_RETRY_ATTEMPTS,
+                    content_length=last_length,
+                )
+
+                if r.status_code == 429 and attempt < FETCH_RETRY_ATTEMPTS:
+                    time.sleep(BACKOFF_BASE_SECONDS * attempt)
+                    continue
+                if transient and attempt < FETCH_RETRY_ATTEMPTS:
+                    time.sleep(BACKOFF_BASE_SECONDS * attempt)
+                    continue
+                break
+            except Exception as exc:
+                log_event(
+                    logging.WARNING,
+                    "fetch_http_exception",
+                    url=url,
+                    host=host,
+                    attempt=attempt,
+                    retry_budget=FETCH_RETRY_ATTEMPTS,
+                    error=str(exc),
+                )
+                if attempt < FETCH_RETRY_ATTEMPTS:
+                    time.sleep(BACKOFF_BASE_SECONDS * attempt)
+                    continue
+                break
+        HOST_FAILURES[host] += 1
+
     try:
         downloaded = trafilatura.fetch_url(url, no_ssl=True)
-        return downloaded or ""
+        if downloaded:
+            HOST_FAILURES[host] = 0
+            return downloaded or ""
     except Exception as exc:
-        logging.warning("trafilatura.fetch_url failed for %s: %s", url, exc)
-        return ""
+        log_event(
+            logging.WARNING,
+            "fetch_trafilatura_exception",
+            url=url,
+            host=host,
+            status=last_status,
+            error=str(exc),
+        )
+
+    INGEST_REPORT["fetch_failures"].append({
+        "url": url,
+        "host": host,
+        "status": last_status,
+        "transient": is_transient_status(last_status) if isinstance(last_status, int) else True,
+        "content_length": last_length,
+    })
+    return ""
 
 def extract_text(url: str) -> str:
     try:
-        if host_of(url) in SKIP_EXTRACT_HOSTS:
+        host = host_of(url)
+        if host in SKIP_EXTRACT_HOSTS:
+            log_event(logging.INFO, "extract_skip_host", url=url, host=host)
+            INGEST_REPORT["extract_failures"].append({
+                "url": url,
+                "host": host,
+                "reason": "skip_host",
+                "transient": False,
+            })
             return ""
         html = _fetch_html(url)
         if not html:
             return ""
         return trafilatura.extract(html, url=url, include_comments=False, include_tables=False) or ""
     except Exception as exc:
-        logging.warning("Failed to extract %s: %s", url, exc)
+        log_event(logging.WARNING, "extract_failure", url=url, host=host_of(url), error=str(exc))
+        INGEST_REPORT["extract_failures"].append({
+            "url": url,
+            "host": host_of(url),
+            "reason": "exception",
+            "transient": True,
+        })
         return ""
 
 
@@ -471,6 +593,21 @@ h1, h2, h3 {{
 </body>
 </html>"""
 
+
+def summarize_ingest() -> None:
+    summary = {
+        "feeds_skipped": len(INGEST_REPORT["feeds_skipped"]),
+        "fetch_failures": len(INGEST_REPORT["fetch_failures"]),
+        "extract_failures": len(INGEST_REPORT["extract_failures"]),
+    }
+    samples = {
+        "skipped_feeds": INGEST_REPORT["feeds_skipped"][:5],
+        "failed_fetches": INGEST_REPORT["fetch_failures"][:5],
+        "failed_extracts": INGEST_REPORT["extract_failures"][:5],
+    }
+    log_event(logging.INFO, "ingest_summary", **summary, samples=samples)
+
+
 # ---- Ingest ----
 def collect_entries(feeds: List[str]) -> List[Dict]:
     items = []
@@ -479,16 +616,45 @@ def collect_entries(feeds: List[str]) -> List[Dict]:
             d = feedparser.parse(url)
             status = getattr(d, "status", None)
             if isinstance(status, int) and status >= 400:
-                logging.warning("Skip feed %s (HTTP %s)", url, status)
+                log_event(
+                    logging.WARNING,
+                    "feed_http_error",
+                    url=url,
+                    status=status,
+                    transient=is_transient_status(status),
+                )
+                INGEST_REPORT["feeds_skipped"].append({
+                    "url": url,
+                    "status": status,
+                    "reason": "http_error",
+                    "transient": is_transient_status(status),
+                })
                 continue
             if getattr(d, "bozo", 0) and not getattr(d, "entries", []):
-                logging.warning("Bozo feed %s: %s", url, getattr(d, "bozo_exception", ""))
+                log_event(
+                    logging.WARNING,
+                    "feed_bozo",
+                    url=url,
+                    reason=str(getattr(d, "bozo_exception", ""))[:400],
+                )
+                INGEST_REPORT["feeds_skipped"].append({
+                    "url": url,
+                    "status": status,
+                    "reason": "bozo",
+                    "transient": False,
+                })
                 continue
         except Exception as exc:
-            logging.warning("Failed to parse feed %s: %s", url, exc)
+            log_event(logging.WARNING, "feed_parse_failed", url=url, error=str(exc))
+            INGEST_REPORT["feeds_skipped"].append({
+                "url": url,
+                "status": None,
+                "reason": "parse_error",
+                "transient": True,
+            })
             continue
         if not getattr(d, "entries", None):
-            logging.warning("No entries in feed %s", url)
+            log_event(logging.INFO, "feed_empty", url=url)
             continue
         for e in d.entries:
             link = clean_url(e.get("link", ""))
@@ -703,7 +869,7 @@ def main() -> None:
     feeds = load_feeds()
     feeds = normalize_feeds(feeds)
     raw = collect_entries(feeds)
-    logging.info("Fetched %d items", len(raw))
+    log_event(logging.INFO, "fetched_items", count=len(raw))
 
     now = now_brussels()
     date_override = os.getenv("DIGEST_DATE", "").strip()
@@ -731,7 +897,24 @@ def main() -> None:
         futures = {ex.submit(extract_text, it["link"]): it for it in deduped}
         for fut in tqdm(as_completed(futures), total=len(futures), desc="Extract"):
             it = futures[fut]
-            it["text"] = fut.result() or it.get("desc", "")
+            text = fut.result()
+            if not text:
+                text = it.get("desc", "")
+            if not text:
+                INGEST_REPORT["extract_failures"].append({
+                    "url": it["link"],
+                    "host": it.get("source", ""),
+                    "reason": "no_text",
+                    "transient": True,
+                })
+                log_event(
+                    logging.WARNING,
+                    "extract_missing_text",
+                    url=it["link"],
+                    host=it.get("source", ""),
+                    transient=True,
+                )
+            it["text"] = text
 
     # Prepare OpenAI client early if needed for annotation/summaries
     api_key = os.getenv("OPENAI_API_KEY")
@@ -859,9 +1042,10 @@ def main() -> None:
     outfp = os.path.join(out_dir, f"digest_{today.isoformat()}.md")
     with open(outfp, "w", encoding="utf-8") as f:
         f.write(md)
-    logging.info("Wrote %s", outfp)
+    log_event(logging.INFO, "wrote_digest", path=outfp)
 
     send_email(f"Weekly AI Digest {today.isoformat()} (last {RECENCY_WINDOW_DAYS} days)", md)
+    summarize_ingest()
 
 
 if __name__ == "__main__":

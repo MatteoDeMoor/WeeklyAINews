@@ -91,3 +91,14 @@ Sample generated Markdown snippet:
 - GitHub Actions workflow `.github/workflows/digest.yml` runs every Monday at 06:00 UTC and commits the generated digest when secrets are configured.
 - You can also schedule a local cron job, e.g., `0 7 * * 1 cd /path/to/WeeklyAINews && ./venv/bin/python digest.py`.
 - To opt out locally, simply do not set up the cron entry (runs are manual-only), and disable the GitHub Actions workflow by pausing or removing the scheduled job in your fork.
+
+---
+
+## License
+
+```text
+Copyright (c) 2025 Matteo De Moor
+All Rights Reserved.
+
+No permission is granted to copy, modify or redistribute this software without explicit written consent from the author.
+```
